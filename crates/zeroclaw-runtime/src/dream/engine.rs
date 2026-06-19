@@ -79,6 +79,12 @@ macro_rules! debug {
 }
 use super::report::DreamReport;
 
+/// Value written into `superseded_by` when a dream cycle retires an entry
+/// non-destructively. Any non-null value hides the row from retrieval; this
+/// marker makes the origin auditable (and distinguishable from a
+/// supersession by a concrete newer entry).
+pub(crate) const DREAM_SUPERSEDE_MARKER: &str = "dream:retired";
+
 // ── Dream cycle result ─────────────────────────────────────────
 
 /// Result of a single dream cycle.
@@ -519,24 +525,41 @@ impl DreamEngine {
 
     // ─��� Phase 4: Prune ─���───────────────────────────────────────
 
-    /// Remove stale daily memories, low-importance entries, and LLM-identified outdated entries.
+    /// Retire one entry by key. Non-destructive by default: marks the entry
+    /// `superseded` (filtered out of retrieval, kept in the store) unless
+    /// `hard_prune` is set, in which case it hard-deletes. Returns whether a
+    /// row was actually retired (`false` on append-only backends in the
+    /// non-destructive mode).
+    async fn retire(&self, memory: &dyn Memory, key: &str) -> Result<bool> {
+        if self.config.hard_prune {
+            memory.forget(key).await
+        } else {
+            memory.mark_superseded(key, DREAM_SUPERSEDE_MARKER).await
+        }
+    }
+
+    /// Retire stale daily memories, low-importance entries, and LLM-identified
+    /// outdated entries. Non-destructive by default (supersede); opt into hard
+    /// deletion via `dream_mode.hard_prune`.
     async fn prune(&self, memory: &dyn Memory, stale_keys: &[String]) -> Result<usize> {
         let mut pruned = 0;
+        let mut attempted = 0;
 
-        // Remove LLM-identified stale entries (empty if local-only).
+        // Retire LLM-identified stale entries (empty if local-only).
         for key in stale_keys {
-            match memory.forget(key).await {
+            attempted += 1;
+            match self.retire(memory, key).await {
                 Ok(true) => pruned += 1,
                 Ok(false) => {
-                    debug!("dream prune: key not found: {key}");
+                    debug!("dream prune: no row retired for key: {key}");
                 }
                 Err(e) => {
-                    debug!("dream prune: failed to forget key {key}: {e}");
+                    debug!("dream prune: failed to retire key {key}: {e}");
                 }
             }
         }
 
-        // Prune old Daily memories beyond max_daily_age_days or below importance threshold.
+        // Retire old Daily memories beyond max_daily_age_days or below importance threshold.
         let cutoff = (Utc::now()
             - chrono::Duration::days(i64::from(self.config.max_daily_age_days)))
         .to_rfc3339();
@@ -550,16 +573,27 @@ impl DreamEngine {
                         .map(|s| s < self.config.prune_threshold)
                         .unwrap_or(false);
 
-                    if (expired || below_threshold)
-                        && let Ok(true) = memory.forget(&entry.key).await
-                    {
-                        pruned += 1;
+                    if expired || below_threshold {
+                        attempted += 1;
+                        if let Ok(true) = self.retire(memory, &entry.key).await {
+                            pruned += 1;
+                        }
                     }
                 }
             }
             Err(e) => {
                 debug!("dream prune: failed to list daily memories: {e}");
             }
+        }
+
+        // Backend-aware honesty: in non-destructive mode, a backend that hid
+        // nothing despite candidates is append-only / supersession-unaware
+        // (markdown, none). Report it instead of silently claiming 0 pruned.
+        if !self.config.hard_prune && attempted > 0 && pruned == 0 {
+            info!(
+                "Dream prune: backend does not support superseding (append-only); \
+                 {attempted} candidate(s) left in place, nothing retired"
+            );
         }
 
         Ok(pruned)
@@ -694,6 +728,7 @@ mod tests {
         entries: Mutex<Vec<MemoryEntry>>,
         stores: Mutex<usize>,
         forgets: Mutex<usize>,
+        supersedes: Mutex<usize>,
     }
 
     impl RecordingMemory {
@@ -702,6 +737,7 @@ mod tests {
                 entries: Mutex::new(entries),
                 stores: Mutex::new(0),
                 forgets: Mutex::new(0),
+                supersedes: Mutex::new(0),
             }
         }
         fn with_entries(entries: Vec<MemoryEntry>) -> Self {
@@ -772,6 +808,10 @@ mod tests {
         }
         async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
             *self.forgets.lock().unwrap() += 1;
+            Ok(true)
+        }
+        async fn mark_superseded(&self, _key: &str, _superseded_by: &str) -> anyhow::Result<bool> {
+            *self.supersedes.lock().unwrap() += 1;
             Ok(true)
         }
         async fn count(&self) -> anyhow::Result<usize> {
@@ -1125,6 +1165,75 @@ mod tests {
         assert!(
             !llm_input.contains("dream_insight_y"),
             "dream-namespaced memory must be filtered out of reflect input"
+        );
+    }
+
+    // ── Non-destructive prune (supersede vs hard-delete) ───────────
+
+    /// By default (`hard_prune = false`) the prune phase retires entries via
+    /// `mark_superseded` (reversible, raw episode kept) and never hard-deletes.
+    #[tokio::test]
+    async fn prune_supersedes_by_default_does_not_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory =
+            RecordingMemory::with_daily_entries(vec![make_daily_entry("old_key", Some(0.05))]);
+        let provider =
+            MockProvider::new(r#"{"insights":[],"stale_keys":["old_key"],"summary":null}"#);
+
+        let config = DreamModeConfig {
+            enabled: true,
+            audit_mode: false, // run consolidate/prune directly (not staged)
+            show_report: false,
+            hard_prune: false, // default — non-destructive
+            ..DreamModeConfig::default()
+        };
+        let engine = DreamEngine::new(config, temp.path().to_path_buf());
+        engine
+            .run_cycle(&memory, Some(&provider), Some("m"))
+            .await
+            .unwrap();
+
+        assert!(
+            *memory.supersedes.lock().unwrap() >= 1,
+            "default prune must supersede (non-destructive)"
+        );
+        assert_eq!(
+            *memory.forgets.lock().unwrap(),
+            0,
+            "default prune must never hard-delete"
+        );
+    }
+
+    /// With `hard_prune = true` the operator opts into destructive deletion.
+    #[tokio::test]
+    async fn prune_hard_deletes_when_opted_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory =
+            RecordingMemory::with_daily_entries(vec![make_daily_entry("old_key", Some(0.05))]);
+        let provider =
+            MockProvider::new(r#"{"insights":[],"stale_keys":["old_key"],"summary":null}"#);
+
+        let config = DreamModeConfig {
+            enabled: true,
+            audit_mode: false,
+            show_report: false,
+            hard_prune: true, // opt into hard delete
+            ..DreamModeConfig::default()
+        };
+        let engine = DreamEngine::new(config, temp.path().to_path_buf());
+        engine
+            .run_cycle(&memory, Some(&provider), Some("m"))
+            .await
+            .unwrap();
+
+        assert!(
+            *memory.forgets.lock().unwrap() >= 1,
+            "hard_prune must hard-delete"
+        );
+        assert_eq!(
+            *memory.supersedes.lock().unwrap(),
+            0,
+            "hard_prune must not supersede"
         );
     }
 }

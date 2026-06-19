@@ -10934,6 +10934,18 @@ pub struct DreamModeConfig {
     /// pruning. Default: `30`.
     #[serde(default = "default_dream_max_daily_age_days")]
     pub max_daily_age_days: u32,
+    /// Whether pruning **hard-deletes** entries. Default: `false` — pruning is
+    /// **non-destructive**: stale/over-age/low-importance entries are marked
+    /// `superseded` (filtered out of retrieval but kept in the store,
+    /// recoverable and auditable). Set `true` to permanently `forget()` them.
+    ///
+    /// On the default hybrid SQLite/vector backend, retrieval is bounded
+    /// top-k and time-decay already down-ranks stale entries, so deletion buys
+    /// no context-window benefit and risks destroying source-of-truth — hence
+    /// the non-destructive default. Append-only backends (markdown) ignore
+    /// both modes (nothing is removed).
+    #[serde(default)]
+    pub hard_prune: bool,
 }
 
 fn default_dream_schedule() -> String {
@@ -10968,6 +10980,7 @@ impl Default for DreamModeConfig {
             show_report: true,
             prune_threshold: default_dream_prune_threshold(),
             max_daily_age_days: default_dream_max_daily_age_days(),
+            hard_prune: false,
         }
     }
 }

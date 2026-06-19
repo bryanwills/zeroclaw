@@ -198,9 +198,13 @@ pub async fn promote(config: &Config) -> Result<()> {
     )
     .context("dream promote: failed to create memory backend")?;
 
-    let result = promote_pending(&config.data_dir, memory.as_ref())
-        .await?
-        .expect("pending was just loaded above");
+    let result = promote_pending(
+        &config.data_dir,
+        memory.as_ref(),
+        config.dream_mode.hard_prune,
+    )
+    .await?
+    .expect("pending was just loaded above");
 
     println!(
         "{}",

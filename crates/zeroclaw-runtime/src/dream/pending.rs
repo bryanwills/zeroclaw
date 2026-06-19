@@ -91,6 +91,11 @@ impl DreamPending {
 
 /// Apply staged dream mutations from `dream_pending.json` to the memory backend.
 ///
+/// Insights are stored as Core memories. Proposed prunes are retired
+/// **non-destructively by default** — marked `superseded` (hidden from
+/// retrieval, kept in the store) unless `hard_prune` is set, in which case they
+/// are permanently deleted.
+///
 /// On success: removes `dream_pending.json`.
 /// On partial failure: rewrites `dream_pending.json` with just the failed items
 /// so the user can retry. This preserves unapplied staged work — promotion is
@@ -98,6 +103,7 @@ impl DreamPending {
 pub async fn promote_pending(
     workspace_dir: &Path,
     memory: &dyn Memory,
+    hard_prune: bool,
 ) -> Result<Option<PromoteResult>> {
     let Some(pending) = DreamPending::load(workspace_dir)? else {
         return Ok(None);
@@ -126,9 +132,20 @@ pub async fn promote_pending(
     let mut pruned = 0usize;
     let mut failed_prunes: Vec<String> = Vec::new();
     for key in &pending.proposed_prunes {
-        match memory.forget(key).await {
+        // Non-destructive by default: supersede (hide from retrieval, keep in
+        // store). `Ok(false)` means there was nothing to retire (already gone /
+        // already superseded / append-only backend) — treat as resolved and
+        // drop it from pending rather than retry forever.
+        let outcome = if hard_prune {
+            memory.forget(key).await
+        } else {
+            memory
+                .mark_superseded(key, super::engine::DREAM_SUPERSEDE_MARKER)
+                .await
+        };
+        match outcome {
             Ok(true) => pruned += 1,
-            Ok(false) => {} // already gone — treat as success, drop from pending
+            Ok(false) => {}
             Err(_) => failed_prunes.push(key.clone()),
         }
     }
@@ -352,7 +369,10 @@ mod tests {
         // Memory that succeeds for the first store, fails on every subsequent.
         let memory = FailingMemory::new(1);
 
-        let result = promote_pending(&workspace, &memory).await.unwrap().unwrap();
+        let result = promote_pending(&workspace, &memory, false)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.stored, 1, "only the first store should succeed");
         assert_eq!(
@@ -396,7 +416,10 @@ mod tests {
 
         let memory = FailingMemory::new(10); // never fails
 
-        let result = promote_pending(&workspace, &memory).await.unwrap().unwrap();
+        let result = promote_pending(&workspace, &memory, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.stored, 1);
         assert!(!result.pending_retained);
         assert!(DreamPending::load(&workspace).unwrap().is_none());
